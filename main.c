@@ -1,5 +1,5 @@
 #define MINI_PY_IMPLEMENTATION
-#include "mini_python.h"
+#include "miniPython.h"
 
 int main(void) {
     Py_Initialize();
