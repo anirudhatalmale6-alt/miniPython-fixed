@@ -1,0 +1,4 @@
+minipy
+test
+test-asan
+*.o

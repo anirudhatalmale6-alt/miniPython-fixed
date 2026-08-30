@@ -184,7 +184,14 @@ enum {
     N_ATTR,
     N_TRUE,
     N_FALSE,
-    N_NONE
+    N_NONE,
+
+    /* Added: the three things the demo in main.c used and the parser did not
+       have. N_COND is `a if c else b`; N_SLICE is the [lo:hi] inside an index;
+       N_COMP is a list comprehension. */
+    N_COND,
+    N_SLICE,
+    N_COMP
 };
 
 struct Node {
@@ -1167,6 +1174,64 @@ static void node_add_name(Node *n, const char *name) {
     n->names[n->nnames++] = xstrdup(name);
 }
 
+/* Freeing an AST.
+ *
+ * Every n->str and every entry of n->names is xstrdup'd, and every child is
+ * owned, so this is a plain recursive free with nothing borrowed inside a
+ * node.
+ *
+ * WHAT IS borrowed is the node itself: `def` stores the function body as a
+ * RAW POINTER into this tree (see new_func's `o->u.func.body = body`). So an
+ * AST must NOT be freed when its script finishes -- any function that script
+ * defined would be left pointing at freed memory, and calling it from a later
+ * PyRun_SimpleString would be a use-after-free. That is a worse bug than the
+ * leak it replaces.
+ *
+ * So the roots are kept and freed in Py_Finalize, when nothing can call into
+ * them any more. That makes the memory BOUNDED and reclaimed rather than lost;
+ * it does not make a long-running REPL free each script as it goes, which
+ * would need the function object to own or refcount its body. */
+static void node_free(Node *n) {
+    if (!n) return;
+
+    for (int i = 0; i < n->nkids; i++)
+        node_free(n->kids[i]);
+
+    for (int i = 0; i < n->nnames; i++)
+        free(n->names[i]);
+
+    free(n->kids);
+    free(n->names);
+    free(n->str);
+    free(n);
+}
+
+/* The ASTs this interpreter owns, in the order they were run. */
+static Node **mp_roots = NULL;
+static int mp_nroots = 0;
+static int mp_rootcap = 0;
+
+static void mp_keep_ast(Node *root) {
+    if (!root) return;
+
+    if (mp_nroots == mp_rootcap) {
+        mp_rootcap = mp_rootcap ? mp_rootcap * 2 : 8;
+        mp_roots = xrealloc(mp_roots, mp_rootcap * sizeof(Node *));
+    }
+
+    mp_roots[mp_nroots++] = root;
+}
+
+static void mp_free_asts(void) {
+    for (int i = 0; i < mp_nroots; i++)
+        node_free(mp_roots[i]);
+
+    free(mp_roots);
+    mp_roots = NULL;
+    mp_nroots = 0;
+    mp_rootcap = 0;
+}
+
 static Node *unary_node(const char *op, Node *a) {
     Node *n = node_new(N_UNARY);
     n->str = xstrdup(op);
@@ -1521,14 +1586,17 @@ static int lex_src(const char *src) {
 static Node *parse_expr(void);
 static Node *parse_statement(void);
 static Node *parse_simple_stmt(void);
+static Node *parse_comparison(void);
+static Node *parse_and(void);
+static Node *parse_not(void);
 
 static Node *parse_or(void) {
-    Node *l = parse_expr();
+    Node *l = parse_and();
     if (!l) return NULL;
 
     while (tk_is(TK_NAME, "or")) {
         pos++;
-        Node *r = parse_expr();
+        Node *r = parse_and();
         if (!r) return NULL;
         l = binary_node("or", l, r);
     }
@@ -1537,12 +1605,12 @@ static Node *parse_or(void) {
 }
 
 static Node *parse_and(void) {
-    Node *l = parse_or();
+    Node *l = parse_not();
     if (!l) return NULL;
 
     while (tk_is(TK_NAME, "and")) {
         pos++;
-        Node *r = parse_or();
+        Node *r = parse_not();
         if (!r) return NULL;
         l = binary_node("and", l, r);
     }
@@ -1558,7 +1626,7 @@ static Node *parse_not(void) {
         return unary_node("not", e);
     }
 
-    return parse_and();
+    return parse_comparison();
 }
 
 static Node *parse_add(void);
@@ -1708,15 +1776,52 @@ static Node *parse_postfix(void) {
         } else if (tk_is(TK_OP, "[")) {
             pos++;
 
-            Node *idx = parse_expr();
-            if (!idx) return NULL;
+            /* A subscript is either [i] or a slice [lo:hi], and either end of a
+               slice may be omitted: [:n], [n:], even [:]. So the colon is what
+               decides which node this is, and it can appear before any
+               expression has been seen at all. */
+            Node *lo = NULL;
+
+            if (!tk_is(TK_OP, ":")) {
+                lo = parse_expr();
+                if (!lo) return NULL;
+            }
+
+            if (tk_is(TK_OP, ":")) {
+                pos++;
+
+                Node *hi = NULL;
+                if (!tk_is(TK_OP, "]")) {
+                    hi = parse_expr();
+                    if (!hi) return NULL;
+                }
+
+                if (!tk_expect(TK_OP, "]"))
+                    return NULL;
+
+                Node *sl = node_new(N_SLICE);
+                node_add(sl, atom);
+                /* A missing bound is stored as N_NONE rather than as a null
+                   child, so the evaluator never has to check nkids to know
+                   what it is holding. */
+                node_add(sl, lo ? lo : node_new(N_NONE));
+                node_add(sl, hi ? hi : node_new(N_NONE));
+
+                atom = sl;
+                continue;
+            }
+
+            if (!lo) {
+                set_error("empty subscript");
+                return NULL;
+            }
 
             if (!tk_expect(TK_OP, "]"))
                 return NULL;
 
             Node *n = node_new(N_INDEX);
             node_add(n, atom);
-            node_add(n, idx);
+            node_add(n, lo);
 
             atom = n;
         } else if (tk_is(TK_OP, ".")) {
@@ -1786,24 +1891,69 @@ static Node *parse_atom(void) {
     if (tk_is(TK_OP, "[")) {
         pos++;
 
-        Node *l = node_new(N_LIST);
-
         if (tk_accept(TK_OP, "]"))
-            return l;
+            return node_new(N_LIST);
 
-        for (;;) {
+        Node *first = parse_expr();
+        if (!first) return NULL;
+
+        /* The N_LIST node is NOT allocated until we know this really is a
+           list. Allocating it up front and then returning an N_COMP instead
+           orphans it -- which is exactly what the first version of this did,
+           for one leaked node per comprehension. */
+
+        /* [expr for name in iterable]  and  [expr for name in iterable if c].
+           Decided here, after the first element, because that is the first
+           point at which a comprehension is distinguishable from a plain list
+           -- `[x` could still become either. */
+        if (tk_is(TK_NAME, "for")) {
+            pos++;
+
+            if (!tk_is(TK_NAME, NULL) || cur()->type != TK_NAME) {
+                set_error("expected a name after 'for'");
+                return NULL;
+            }
+
+            char *var = cur()->text;
+            pos++;
+
+            if (!tk_expect(TK_NAME, "in"))
+                return NULL;
+
+            Node *iter = parse_or();          /* not parse_expr: a trailing
+                                                 `if` here is the filter, not a
+                                                 conditional expression */
+            if (!iter) return NULL;
+
+            Node *cond = NULL;
+            if (tk_is(TK_NAME, "if")) {
+                pos++;
+                cond = parse_or();
+                if (!cond) return NULL;
+            }
+
+            if (!tk_expect(TK_OP, "]"))
+                return NULL;
+
+            Node *c = node_new(N_COMP);
+            c->str = xstrdup(var);
+            node_add(c, first);
+            node_add(c, iter);
+            node_add(c, cond ? cond : node_new(N_NONE));
+            return c;
+        }
+
+        Node *l = node_new(N_LIST);
+        node_add(l, first);
+
+        while (tk_accept(TK_OP, ",")) {
+            if (tk_is(TK_OP, "]"))
+                break;
+
             Node *e = parse_expr();
             if (!e) return NULL;
 
             node_add(l, e);
-
-            if (tk_accept(TK_OP, ",")) {
-                if (tk_is(TK_OP, "]"))
-                    break;
-                continue;
-            }
-
-            break;
         }
 
         if (!tk_expect(TK_OP, "]"))
@@ -1887,8 +2037,37 @@ static Node *parse_atom(void) {
     return NULL;
 }
 
+/* The conditional expression, `a if c else b`.
+ *
+ * Python puts it BELOW `or` in precedence -- `x if a or b else y` groups the
+ * condition as `(a or b)` -- so it goes here, between parse_expr and
+ * parse_or, and its three parts are parsed at the level below it. The `else`
+ * branch is parsed at THIS level so that `a if c else b if d else e` chains to
+ * the right, which is what Python does. */
 static Node *parse_expr(void) {
-    return parse_not();
+    Node *l = parse_or();
+    if (!l) return NULL;
+
+    if (tk_is(TK_NAME, "if")) {
+        pos++;
+
+        Node *cond = parse_or();
+        if (!cond) return NULL;
+
+        if (!tk_expect(TK_NAME, "else"))
+            return NULL;
+
+        Node *other = parse_expr();
+        if (!other) return NULL;
+
+        Node *n = node_new(N_COND);
+        node_add(n, cond);
+        node_add(n, l);
+        node_add(n, other);
+        return n;
+    }
+
+    return l;
 }
 
 static Node *parse_suite(void) {
@@ -2433,6 +2612,147 @@ static PyObject *eval(Node *n, Env *env) {
             Py_DecRef(idx);
 
             return res;
+        }
+
+        /* a if c else b. Only the branch that is taken is evaluated, which is
+           the whole reason this is an expression form and not a function --
+           `x[0] if x else None` has to be safe when x is empty. */
+        case N_COND: {
+            PyObject *c = eval(n->kids[0], env);
+            if (!c) return NULL;
+
+            int t = obj_true(c);
+            Py_DecRef(c);
+
+            return eval(n->kids[t ? 1 : 2], env);
+        }
+
+        /* obj[lo:hi], with either bound omitted.
+         *
+         * Slice bounds are NOT index bounds and the difference matters: an
+         * index out of range is an error, a slice bound out of range is
+         * clamped. `[1,2,3][0:99]` is the whole list, not a failure. Negative
+         * bounds count from the end, and after that clamping still applies. */
+        case N_SLICE: {
+            PyObject *obj = eval(n->kids[0], env);
+            if (!obj) return NULL;
+
+            long long len;
+            if (obj->type == PY_LIST || obj->type == PY_TUPLE)
+                len = (long long)obj->u.seq.len;
+            else if (obj->type == PY_STR)
+                len = (long long)obj->u.str.len;
+            else {
+                set_error("object is not sliceable");
+                Py_DecRef(obj);
+                return NULL;
+            }
+
+            long long lo = 0, hi = len;
+
+            if (n->kids[1]->kind != N_NONE) {
+                PyObject *v = eval(n->kids[1], env);
+                if (!v) { Py_DecRef(obj); return NULL; }
+                if (v->type != PY_INT && v->type != PY_BOOL) {
+                    set_error("slice indices must be integers");
+                    Py_DecRef(v); Py_DecRef(obj);
+                    return NULL;
+                }
+                lo = (v->type == PY_INT) ? v->u.i : (long long)v->u.b;
+                Py_DecRef(v);
+            }
+
+            if (n->kids[2]->kind != N_NONE) {
+                PyObject *v = eval(n->kids[2], env);
+                if (!v) { Py_DecRef(obj); return NULL; }
+                if (v->type != PY_INT && v->type != PY_BOOL) {
+                    set_error("slice indices must be integers");
+                    Py_DecRef(v); Py_DecRef(obj);
+                    return NULL;
+                }
+                hi = (v->type == PY_INT) ? v->u.i : (long long)v->u.b;
+                Py_DecRef(v);
+            }
+
+            if (lo < 0) lo += len;
+            if (hi < 0) hi += len;
+            if (lo < 0) lo = 0;
+            if (hi > len) hi = len;
+            if (hi < lo) hi = lo;
+
+            if (obj->type == PY_STR) {
+                PyObject *r = new_str_len(obj->u.str.s + lo, (size_t)(hi - lo));
+                Py_DecRef(obj);
+                return r;
+            }
+
+            {
+                PyObject *r = new_list();
+                for (long long i = lo; i < hi; i++)
+                    seq_append(r, obj->u.seq.items[i]);
+                Py_DecRef(obj);
+                return r;
+            }
+        }
+
+        /* [expr for name in iterable] and [expr for name in iterable if cond].
+         *
+         * The loop variable is set in the ENCLOSING environment, which is what
+         * Python 2 did and what this interpreter's `for` statement already
+         * does -- matching the statement rather than inventing a second scope
+         * rule for the expression form. */
+        case N_COMP: {
+            PyObject *coll = eval(n->kids[1], env);
+            if (!coll) return NULL;
+
+            PyObject *out = new_list();
+            long long len;
+
+            if (coll->type == PY_LIST || coll->type == PY_TUPLE)
+                len = (long long)coll->u.seq.len;
+            else if (coll->type == PY_STR)
+                len = (long long)coll->u.str.len;
+            else {
+                set_error("object is not iterable");
+                Py_DecRef(out);
+                Py_DecRef(coll);
+                return NULL;
+            }
+
+            for (long long i = 0; i < len; i++) {
+                PyObject *item;
+
+                if (coll->type == PY_STR)
+                    item = new_str_len(coll->u.str.s + i, 1);
+                else {
+                    item = coll->u.seq.items[i];
+                    Py_IncRef(item);
+                }
+
+                env_set_local(env, n->str, item);
+                Py_DecRef(item);
+
+                if (n->kids[2]->kind != N_NONE) {
+                    PyObject *c = eval(n->kids[2], env);
+                    if (!c) { Py_DecRef(out); Py_DecRef(coll); return NULL; }
+
+                    int keep = obj_true(c);
+                    Py_DecRef(c);
+
+                    if (!keep) continue;
+                }
+
+                {
+                    PyObject *v = eval(n->kids[0], env);
+                    if (!v) { Py_DecRef(out); Py_DecRef(coll); return NULL; }
+
+                    seq_append(out, v);
+                    Py_DecRef(v);
+                }
+            }
+
+            Py_DecRef(coll);
+            return out;
         }
 
         case N_ATTR:
@@ -3553,8 +3873,44 @@ void Py_Finalize(void) {
     if (!mp_initialized)
         return;
 
+    /* Break the def-cycle before tearing anything down.
+     *
+     * Every top-level `def` makes one: the global environment holds the
+     * function object, and the function object holds its closure, which IS the
+     * global environment. Two refcounts pointing at each other, so neither
+     * ever reaches zero and env_decref below would drop the count from 2 to 1
+     * and free nothing at all -- taking the whole global environment, every
+     * function in it, and every string in both, with it.
+     *
+     * A tracing collector would find this. Without one, finalize is exactly
+     * the right place to cut it by hand, because that is the moment nothing
+     * can call these functions again.
+     *
+     * The count is adjusted in one go rather than calling env_decref inside
+     * the loop, which could free the environment halfway through iterating it. */
+    {
+        int held = 0;
+
+        for (int i = 0; i < GLOBAL_ENV->n; i++) {
+            PyObject *v = GLOBAL_ENV->vars[i].val;
+
+            if (v && v->type == PY_FUNC && v->u.func.closure == GLOBAL_ENV) {
+                v->u.func.closure = NULL;   /* free_object env_decrefs this */
+                held++;
+            }
+        }
+
+        GLOBAL_ENV->refcnt -= held;
+    }
+
+    /* The environment first: it holds the function objects, and each of those
+       holds a raw pointer into an AST. Dropping them before the trees they
+       point at is the ordering that makes freeing the trees safe. */
     env_decref(GLOBAL_ENV);
     GLOBAL_ENV = NULL;
+
+    mp_free_asts();
+    clear_tokens();
 
     mp_initialized = 0;
 }
@@ -3579,6 +3935,10 @@ int PyRun_SimpleString(const char *src) {
         clear_tokens();
         return -1;
     }
+
+    /* Handed to the interpreter to own. NOT freed after exec -- see
+       node_free: a `def` in this script left a raw pointer to its body here. */
+    mp_keep_ast(prog);
 
     PyObject *ret = NULL;
     int st = exec(prog, GLOBAL_ENV, &ret);
